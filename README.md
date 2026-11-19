@@ -24,6 +24,24 @@ sh cloudflare-ddns.sh
 
 给已安装的机器加域名时，重新运行安装脚本，把原域名和新域名一起填入。域名和 Token 的提示都支持回车沿用当前值。旧版的单域名设置会自动读取。
 
+## Lightsail TCP 探测与动态 IPv4 换址
+
+在一台独立的 Linux 探测机上运行。选择和目标用户网络条件相近的探测点，探测 Lightsail 实际对外服务的 TCP 端口。连接失败表示该探测点到端口不可达，可能与应用监听、防火墙或线路有关。该流程适用于使用动态公网 IPv4 的 Lightsail 实例。停机和重新启动期间，实例上的服务会中断。 [Lightsail 公网地址](https://docs.aws.amazon.com/lightsail/latest/userguide/understanding-public-ip-and-private-ip-addresses-in-amazon-lightsail.html)
+
+1. 在探测机安装 AWS CLI，配置 root 可用的 profile。IAM 中为 `lightsail:GetInstance` 使用 `Resource: "*"`，为 `lightsail:StopInstance` 和 `lightsail:StartInstance` 使用目标实例的 ARN。 [AWS CLI profile](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html) · [Lightsail IAM 权限](https://docs.aws.amazon.com/service-authorization/latest/reference/list_lightsail.html)
+2. 如果原来在 Lightsail 上有相同域名的 DDNS 定时器，按下面的换机步骤停止它，把 DNS 更新交给探测机。
+3. 在探测机的 FinalShell 终端执行安装命令，输入域名、Cloudflare Token、AWS Region、Lightsail 实例名、AWS CLI profile 和 TCP 端口。
+
+```bash
+curl -fsSL --retry 3 https://raw.githubusercontent.com/joeykini/ddnsip/main/cloudflare-ddns.sh -o cloudflare-ddns.sh && sh cloudflare-ddns.sh --lightsail
+```
+
+可以用 `sudo -H aws configure --profile lightsail-ddns` 创建本机 profile，安装时填 `lightsail-ddns`。
+
+探测机每分钟查一次实例状态并尝试连接端口。连续三轮失败后，脚本请求停机，等到 Lightsail 报告 `stopped` 再请求启动。实例重新运行且拿到公网 IPv4 后，脚本会更新配置的 Cloudflare A 记录，并继续检查端口。每次故障最多执行一次停启，端口恢复且上一次停启已超过一小时后，才允许处理下一次故障。 [Lightsail 停机 API](https://docs.aws.amazon.com/cli/latest/reference/lightsail/stop-instance.html) · [Lightsail 启动 API](https://docs.aws.amazon.com/cli/latest/reference/lightsail/start-instance.html)
+
+Lightsail 模式下，下面的手动 `update` 命令也会进行一次探测和故障判断。维护实例前，先确认上一次停启流程已经结束，再暂停探测机上的定时任务。
+
 ## 换机和检查
 
 换机复用同一域名时，先停止旧机器上的更新任务，再在新机器运行安装脚本。

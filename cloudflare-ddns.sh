@@ -1,6 +1,14 @@
 #!/bin/sh
 (
     set -eu
+    case "$#:${1-}" in
+        0:) cf_ddns_action=install ;;
+        1:--lightsail) cf_ddns_action=install-lightsail ;;
+        *)
+            printf '%s\n' '用法 sh cloudflare-ddns.sh [--lightsail]' >&2
+            exit 2
+            ;;
+    esac
     cf_ddns_uid=$(id -u)
     cf_ddns_run() {
         if [ "$cf_ddns_uid" -eq 0 ]; then
@@ -40,9 +48,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import closing, contextmanager
 from pathlib import Path
 from urllib.parse import urlencode
@@ -55,6 +65,11 @@ SYSTEMD_RUNTIME = Path("/run/systemd/system")
 PROGRAM = Path("/usr/local/sbin/cloudflare-ddns")
 SERVICE = "cloudflare-ddns.service"
 TIMER = "cloudflare-ddns.timer"
+TCP_FAILURE_LIMIT = 3
+TCP_FAILURE_WINDOW = 240
+LIGHTSAIL_RESTART_COOLDOWN = 3600
+LIGHTSAIL_STOP_WAIT = 900
+LIGHTSAIL_START_RETRY_DELAY = 120
 
 
 class DDNSError(Exception):
@@ -250,8 +265,9 @@ def sync_record(token, target, ip, source):
         print(f"已创建 {name} → {ip}（{source}）。", flush=True)
 
 
-def sync_records(config):
-    ip, source = current_ipv4()
+def sync_records(config, ip=None, source=None):
+    if ip is None:
+        ip, source = current_ipv4()
     errors = []
     for target in config["records"]:
         try:
@@ -287,7 +303,201 @@ def config_lock():
         yield
 
 
-def install():
+def lightsail_request(settings, operation):
+    args = [
+        settings["aws"], "--region", settings["region"], "--profile", settings["profile"],
+        "--output", "json", "--cli-connect-timeout", "5", "--cli-read-timeout", "10",
+        "lightsail", operation, "--instance-name", settings["instance_name"],
+    ]
+    env = {**os.environ, "AWS_PAGER": "", "AWS_CLI_AUTO_PROMPT": "off", "AWS_MAX_ATTEMPTS": "1"}
+    try:
+        result = subprocess.run(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", env=env, timeout=22,
+        )
+    except subprocess.TimeoutExpired:
+        raise DDNSError(f"Lightsail {operation} 请求超时，请查看实例状态。") from None
+    except (OSError, UnicodeError):
+        raise DDNSError("无法运行 AWS CLI，请检查探测机上的安装。") from None
+    if result.returncode:
+        aws_code = re.search(r"An error occurred \(([a-zA-Z0-9_-]+)\)", result.stderr)
+        code = f"（{aws_code.group(1)}）" if aws_code else ""
+        raise DDNSError(f"Lightsail {operation} 失败{code}，请检查 AWS CLI profile、区域和权限。")
+    try:
+        response = json.loads(result.stdout)
+        if not isinstance(response, dict):
+            raise ValueError("unexpected response")
+    except ValueError:
+        raise DDNSError(f"Lightsail {operation} 返回了无法解析的响应。") from None
+    if any(item.get("status") == "Failed" for item in response.get("operations", [])):
+        raise DDNSError(f"Lightsail {operation} 报告操作失败，请在 AWS 控制台查看实例状态。")
+    return response
+
+
+def lightsail_instance(settings):
+    instance = lightsail_request(settings, "get-instance").get("instance", {})
+    arn = instance.get("arn")
+    region = re.escape(settings["region"])
+    expected_arn = settings.get("instance_arn")
+    if (
+        not isinstance(arn, str)
+        or not re.fullmatch(rf"arn:[a-z0-9-]+:lightsail:{region}:[0-9]{{12}}:Instance/[A-Za-z0-9_-]+", arn)
+        or instance.get("name") != settings["instance_name"]
+        or (expected_arn and arn != expected_arn)
+    ):
+        raise DDNSError("Lightsail 实例标识与配置不一致。")
+    return instance
+
+
+def lightsail_ipv4(instance):
+    try:
+        return public_ipv4(instance.get("publicIpAddress") or "")
+    except ValueError:
+        raise DDNSError("Lightsail 当前没有可用的公网 IPv4。") from None
+
+
+def check_observer(address):
+    try:
+        observer_address, _ = current_ipv4()
+    except DDNSError:
+        return
+    if observer_address == address:
+        raise DDNSError("请把 Lightsail 换址任务安装到另一台探测机，目标实例停机后任务仍需运行。")
+
+
+def tcp_reachable(address, port):
+    try:
+        with socket.create_connection((address, port), timeout=4):
+            return True
+    except OSError:
+        return False
+
+
+def prompt_lightsail(previous):
+    aws = shutil.which("aws")
+    if not aws:
+        raise DDNSError("请先在探测机安装 AWS CLI 并配置运行定时任务的 AWS profile。")
+
+    def ask(key, label, default=""):
+        default = str(previous.get(key, default))
+        prompt = f"{label} [{default}]" if default else label
+        return input(prompt + "：").strip() or default
+
+    region = ask("region", "Lightsail AWS Region")
+    instance_name = ask("instance_name", "Lightsail 实例名称")
+    profile = ask("profile", "AWS CLI profile", "default")
+    port = ask("port", "要探测的 TCP 服务端口")
+    if not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]+", region):
+        raise DDNSError("请输入 AWS Region，例如 ap-northeast-1。")
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*[A-Za-z0-9_]", instance_name):
+        raise DDNSError("请输入 Lightsail 控制台中的实例名称。")
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", profile):
+        raise DDNSError("请输入有效的 AWS CLI profile 名称。")
+    if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+        raise DDNSError("TCP 端口必须介于 1 和 65535。")
+
+    settings = {
+        "aws": aws, "region": region, "instance_name": instance_name,
+        "profile": profile, "port": int(port),
+    }
+    instance = lightsail_instance(settings)
+    if instance.get("state", {}).get("name") != "running" or instance.get("isStaticIp") is not False:
+        raise DDNSError("启用自动换址需要一台正在运行、使用动态公网 IPv4 的 Lightsail 实例。")
+    address = lightsail_ipv4(instance)
+    check_observer(address)
+    settings["instance_arn"] = instance["arn"]
+    print(f"已找到 {instance_name}，当前公网 IPv4 为 {address}。", flush=True)
+    return settings, address
+
+
+def read_lightsail_state(path, settings):
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        state = {}
+    if state.get("instance_arn") != settings["instance_arn"]:
+        return {"instance_arn": settings["instance_arn"]}
+    return state
+
+
+def start_stopped_lightsail(settings, state, save, now):
+    if now - state.get("last_start_attempt", 0) < LIGHTSAIL_START_RETRY_DELAY:
+        print("等待 Lightsail 更新上一次启动请求的状态。", flush=True)
+        return
+    state["last_start_attempt"] = now
+    save()
+    lightsail_request(settings, "start-instance")
+    print("Lightsail 已请求启动，等待新的公网 IPv4。", flush=True)
+
+
+def update_lightsail(config):
+    settings = config["lightsail"]
+    instance = lightsail_instance(settings)
+    instance_name = settings["instance_name"]
+    status = instance.get("state", {}).get("name", "unknown")
+    state_path = STATE_DIR / "lightsail-state.json"
+    state = read_lightsail_state(state_path, settings)
+    now = int(time.time())
+
+    def save():
+        write_file(state_path, json.dumps(state) + "\n", 0o600)
+
+    pending_ip = state.get("pending_ip")
+    if pending_ip and status == "stopped":
+        start_stopped_lightsail(settings, state, save, now)
+        return
+    if status != "running":
+        print(f"Lightsail {instance_name} 当前为 {status}，等待运行。", flush=True)
+        return
+    address = lightsail_ipv4(instance)
+    if pending_ip and address == pending_ip and now - state["last_restart"] < LIGHTSAIL_STOP_WAIT:
+        print(f"等待 Lightsail {instance_name} 的公网 IPv4 更新。", flush=True)
+        return
+
+    sync_records(config, address, "Lightsail 公网 IPv4")
+    if pending_ip:
+        if address == pending_ip:
+            print(f"Lightsail {instance_name} 仍显示原公网 IPv4。请在 AWS 控制台检查停启操作。", flush=True)
+        else:
+            print(f"Lightsail {instance_name} 公网 IPv4 已切换为 {address}，DNS 已同步。", flush=True)
+        state.pop("pending_ip", None)
+        state.pop("last_start_attempt", None)
+
+    port = settings["port"]
+    if tcp_reachable(address, port):
+        if state.get("failures") or state.get("attempted"):
+            state.update(failures=0, attempted=False)
+            save()
+        print(f"Lightsail TCP {address}:{port} 可连通。", flush=True)
+        return
+
+    same_probe = (
+        state.get("probe_ip") == address
+        and state.get("probe_port") == port
+        and 0 <= now - state.get("last_failure", 0) <= TCP_FAILURE_WINDOW
+    )
+    failures = state.get("failures", 0) + 1 if same_probe else 1
+    state.update(probe_ip=address, probe_port=port, last_failure=now, failures=min(failures, TCP_FAILURE_LIMIT))
+    save()
+    if instance.get("isStaticIp") is not False:
+        print("Lightsail 已绑定静态 IP，TCP 探测失败，保留现有地址。", flush=True)
+        return
+    if failures < TCP_FAILURE_LIMIT:
+        print(f"Lightsail TCP {address}:{port} 连续失败 {failures}/{TCP_FAILURE_LIMIT} 次。", flush=True)
+        return
+    if state.get("attempted") or now - state.get("last_restart", 0) < LIGHTSAIL_RESTART_COOLDOWN:
+        print("Lightsail TCP 仍不可达。再次自动换址需要 TCP 恢复且满足停启间隔。", flush=True)
+        return
+
+    check_observer(address)
+    # Keep enough state to start the instance even if the stop response is lost.
+    state.update(pending_ip=address, last_restart=now, attempted=True)
+    save()
+    print(f"Lightsail {instance_name} 的 TCP {address}:{port} 连续失败，正在请求停机换址。", flush=True)
+    lightsail_request(settings, "stop-instance")
+
+
+def install(enable_lightsail=False):
     if not SYSTEMD_RUNTIME.is_dir() or not shutil.which("systemctl"):
         raise DDNSError("请在使用 systemd 的 Linux 主机上运行。")
     if not sys.stdin.isatty():
@@ -329,6 +539,9 @@ def install():
         records.append({"hostname": hostname, "zone_id": zone_id})
         print(f"{hostname} 的 Cloudflare Zone：{zone_name}", flush=True)
     config = {"token": token, "records": records}
+    lightsail_address = None
+    if enable_lightsail or previous.get("lightsail"):
+        config["lightsail"], lightsail_address = prompt_lightsail(previous.get("lightsail", {}))
 
     interpreter = sys.executable.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     service = f"""[Unit]
@@ -340,7 +553,7 @@ After=network-online.target
 Type=oneshot
 Environment=PYTHONIOENCODING=utf-8
 ExecStart="{interpreter}" {PROGRAM} update
-TimeoutStartSec={max(90, 30 + 30 * len(records))}
+TimeoutStartSec={max(90, (90 if lightsail_address else 30) + 30 * len(records))}
 """
     timer = f"""[Unit]
 Description=Refresh Cloudflare DDNS every minute
@@ -355,7 +568,7 @@ Unit={SERVICE}
 WantedBy=timers.target
 """
     with config_lock():
-        sync_records(config)
+        sync_records(config, lightsail_address, "Lightsail 公网 IPv4")
         write_file(PROGRAM, Path(__file__).read_text(encoding="utf-8"), 0o755)
         write_file(UNIT_DIR / SERVICE, service, 0o644)
         write_file(UNIT_DIR / TIMER, timer, 0o644)
@@ -373,11 +586,15 @@ def main():
     if os.geteuid() != 0:
         raise DDNSError("请用 root 或 sudo 运行。")
     os.umask(0o077)
-    if sys.argv[1:] == ["install"]:
-        install()
+    if sys.argv[1:] in (["install"], ["install-lightsail"]):
+        install(enable_lightsail=sys.argv[1] == "install-lightsail")
     elif sys.argv[1:] == ["update"]:
         with config_lock():
-            sync_records(read_config())
+            config = read_config()
+            if config.get("lightsail"):
+                update_lightsail(config)
+            else:
+                sync_records(config)
     else:
         raise DDNSError("请运行安装脚本，或执行 cloudflare-ddns update 手动同步。")
 
@@ -393,5 +610,5 @@ if __name__ == "__main__":
         sys.exit(1)
 DDNS_PYTHON
 
-    cf_ddns_run env PYTHONIOENCODING=utf-8 "$(command -v python3)" "$cf_ddns_installer" install < /dev/tty
+    cf_ddns_run env PYTHONIOENCODING=utf-8 "$(command -v python3)" "$cf_ddns_installer" "$cf_ddns_action" < /dev/tty
 )
