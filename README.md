@@ -24,19 +24,21 @@ sh cloudflare-ddns.sh
 
 给已安装的机器加域名时，重新运行安装脚本，把原域名和新域名一起填入。域名和 Token 的提示都支持回车沿用当前值。旧版的单域名设置会自动读取。
 
+如果只是让域名跟随 Lightsail 的公网 IPv4，在 Lightsail 本机运行上面的普通安装命令即可。安装会启用开机自启的 DDNS 定时器。从 AWS 控制台停机并重新启动后，定时器会检测新的公网 IPv4 并更新域名。
+
 ## Lightsail TCP 探测与动态 IPv4 换址
 
 在一台独立的 Linux 探测机上运行。选择和目标用户网络条件相近的探测点，探测 Lightsail 实际对外服务的 TCP 端口。连接失败表示该探测点到端口不可达，可能与应用监听、防火墙或线路有关。该流程适用于使用动态公网 IPv4 的 Lightsail 实例。停机和重新启动期间，实例上的服务会中断。 [Lightsail 公网地址](https://docs.aws.amazon.com/lightsail/latest/userguide/understanding-public-ip-and-private-ip-addresses-in-amazon-lightsail.html)
 
-1. 在探测机安装 AWS CLI，配置 root 可用的 profile。IAM 中为 `lightsail:GetInstance` 使用 `Resource: "*"`，为 `lightsail:StopInstance` 和 `lightsail:StartInstance` 使用目标实例的 ARN。 [AWS CLI profile](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html) · [Lightsail IAM 权限](https://docs.aws.amazon.com/service-authorization/latest/reference/list_lightsail.html)
+1. 在探测机安装 AWS CLI，配置 root 可用的凭证，并在 profile 中保存目标 Lightsail 的区域。IAM 中为 `lightsail:GetInstance` 使用 `Resource: "*"`，为 `lightsail:StopInstance` 和 `lightsail:StartInstance` 使用目标实例的 ARN。给 `lightsail:GetInstances` 授予 `Resource: "*"` 可让安装脚本按现有 A 记录自动匹配实例。 [AWS CLI profile](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html) · [Lightsail IAM 权限](https://docs.aws.amazon.com/service-authorization/latest/reference/list_lightsail.html)
 2. 如果原来在 Lightsail 上有相同域名的 DDNS 定时器，按下面的换机步骤停止它，把 DNS 更新交给探测机。
-3. 在探测机的 FinalShell 终端执行安装命令，输入域名、Cloudflare Token、AWS Region、Lightsail 实例名、AWS CLI profile 和 TCP 端口。
+3. 在探测机的 FinalShell 终端执行安装命令，输入域名和 Cloudflare Token。按提示确认 TCP 端口。若业务用 `443/TCP` 且当前探测可连通，直接回车。
 
 ```bash
 curl -fsSL --retry 3 https://raw.githubusercontent.com/joeykini/ddnsip/main/cloudflare-ddns.sh -o cloudflare-ddns.sh && sh cloudflare-ddns.sh --lightsail
 ```
 
-可以用 `sudo -H aws configure --profile lightsail-ddns` 创建本机 profile，安装时填 `lightsail-ddns`。
+可以用 `sudo -H aws configure --profile lightsail-ddns` 创建探测机上的 profile。脚本自动采用已选定或唯一的 profile，并读取已配置的 Region。如果 Cloudflare A 记录的实际 IPv4 能匹配该区域的一台 Lightsail，实例名也会自动带出。需要选择 profile、缺少 Region 或匹配不到实例时再填写相应信息。重新安装时可以回车沿用保存的目标，或输入 `r` 重选。
 
 探测机每分钟查一次实例状态并尝试连接端口。连续三轮失败后，脚本请求停机，等到 Lightsail 报告 `stopped` 再请求启动。实例重新运行且拿到公网 IPv4 后，脚本会更新配置的 Cloudflare A 记录，并继续检查端口。每次故障最多执行一次停启，端口恢复且上一次停启已超过一小时后，才允许处理下一次故障。 [Lightsail 停机 API](https://docs.aws.amazon.com/cli/latest/reference/lightsail/stop-instance.html) · [Lightsail 启动 API](https://docs.aws.amazon.com/cli/latest/reference/lightsail/start-instance.html)
 

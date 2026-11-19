@@ -234,9 +234,11 @@ def find_zone(hostname, zones):
     return cloudflare_id(active[0].get("id")), zone_name
 
 
-def sync_record(token, target, ip, source):
-    zone_id, name = target["zone_id"], target["hostname"]
-    endpoint = f"/zones/{cloudflare_id(zone_id)}/dns_records"
+def dns_records_endpoint(target):
+    return f'/zones/{cloudflare_id(target["zone_id"])}/dns_records'
+
+
+def read_a_record(token, endpoint, name):
     entries = [
         record for record in list_entries(token, endpoint, {"name.exact": name})
         if record.get("name", "").lower() == name
@@ -246,14 +248,19 @@ def sync_record(token, target, ip, source):
     records = [record for record in entries if record.get("type") == "A"]
     if len(records) > 1:
         raise DDNSError("有多条同名 A 记录，请选择只有一条 A 记录的域名。")
+    return records[0] if records else None
 
-    if records and records[0].get("content") == ip:
+
+def sync_record(token, target, ip, source):
+    name = target["hostname"]
+    endpoint = dns_records_endpoint(target)
+    record = read_a_record(token, endpoint, name)
+    if record and record.get("content") == ip:
         print(f"{name} 已指向 {ip}（{source}）。", flush=True)
         return
 
     payload = {"type": "A", "name": name, "content": ip}
-    if records:
-        record = records[0]
+    if record:
         payload["ttl"] = record["ttl"]
         if "proxied" in record:
             payload["proxied"] = record["proxied"]
@@ -303,22 +310,32 @@ def config_lock():
         yield
 
 
-def lightsail_request(settings, operation):
-    args = [
-        settings["aws"], "--region", settings["region"], "--profile", settings["profile"],
-        "--output", "json", "--cli-connect-timeout", "5", "--cli-read-timeout", "10",
-        "lightsail", operation, "--instance-name", settings["instance_name"],
-    ]
+def aws_process(aws, args):
     env = {**os.environ, "AWS_PAGER": "", "AWS_CLI_AUTO_PROMPT": "off", "AWS_MAX_ATTEMPTS": "1"}
     try:
-        result = subprocess.run(
-            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        return subprocess.run(
+            [aws, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             encoding="utf-8", env=env, timeout=22,
         )
     except subprocess.TimeoutExpired:
-        raise DDNSError(f"Lightsail {operation} 请求超时，请查看实例状态。") from None
+        raise DDNSError("AWS CLI 请求超时，请检查网络和 Lightsail 实例状态。") from None
     except (OSError, UnicodeError):
         raise DDNSError("无法运行 AWS CLI，请检查探测机上的安装。") from None
+
+
+def aws_profile_args(profile):
+    return ["--profile", profile] if profile else []
+
+
+def lightsail_request(settings, operation):
+    args = [
+        "--region", settings["region"], *aws_profile_args(settings["profile"]),
+        "--output", "json", "--cli-connect-timeout", "5", "--cli-read-timeout", "10",
+        "lightsail", operation,
+    ]
+    if operation != "get-instances":
+        args.extend(["--instance-name", settings["instance_name"]])
+    result = aws_process(settings["aws"], args)
     if result.returncode:
         aws_code = re.search(r"An error occurred \(([a-zA-Z0-9_-]+)\)", result.stderr)
         code = f"（{aws_code.group(1)}）" if aws_code else ""
@@ -373,40 +390,109 @@ def tcp_reachable(address, port):
         return False
 
 
-def prompt_lightsail(previous):
-    aws = shutil.which("aws")
-    if not aws:
-        raise DDNSError("请先在探测机安装 AWS CLI 并配置运行定时任务的 AWS profile。")
+def input_with_default(label, default=""):
+    prompt = f"{label} [{default}]" if default else label
+    return input(prompt + "：").strip() or default
 
-    def ask(key, label, default=""):
-        default = str(previous.get(key, default))
-        prompt = f"{label} [{default}]" if default else label
-        return input(prompt + "：").strip() or default
 
-    region = ask("region", "Lightsail AWS Region")
-    instance_name = ask("instance_name", "Lightsail 实例名称")
-    profile = ask("profile", "AWS CLI profile", "default")
-    port = ask("port", "要探测的 TCP 服务端口")
-    if not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]+", region):
+def choose_aws_profile(aws):
+    profile = os.environ.get("AWS_PROFILE") or os.environ.get("AWS_DEFAULT_PROFILE")
+    if not profile:
+        result = aws_process(aws, ["configure", "list-profiles"])
+        profiles = result.stdout.splitlines() if result.returncode == 0 else []
+        if len(profiles) > 1:
+            print(f"可用 AWS CLI profile：{', '.join(profiles)}", flush=True)
+            default = "default" if "default" in profiles else ""
+            profile = input_with_default("用于 Lightsail 的 AWS CLI profile", default)
+            if not profile:
+                raise DDNSError("请选择目标 AWS 账号的 profile。")
+        else:
+            profile = profiles[0] if profiles else ""
+    if profile and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", profile):
+        raise DDNSError("请输入有效的 AWS CLI profile 名称。")
+    return profile
+
+
+def discover_lightsail(settings, config):
+    addresses = set()
+    for target in config["records"]:
+        record = read_a_record(config["token"], dns_records_endpoint(target), target["hostname"])
+        if record:
+            addresses.add(record.get("content"))
+    if len(addresses) != 1 or not next(iter(addresses)):
+        return None
+
+    try:
+        instances = lightsail_request(settings, "get-instances").get("instances", [])
+    except DDNSError as error:
+        print(f"自动查询实例遇到问题。{error}", flush=True)
+        return None
+    matches = [instance for instance in instances if instance.get("publicIpAddress") in addresses]
+    return matches[0] if len(matches) == 1 else None
+
+
+def choose_lightsail(config, aws):
+    profile = choose_aws_profile(aws)
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if not region:
+        result = aws_process(aws, ["configure", "get", "region", *aws_profile_args(profile)])
+        region = result.stdout.strip() if result.returncode == 0 else ""
+    region_detected = bool(region)
+    region = region or input_with_default("Lightsail AWS Region")
+    region_pattern = r"[a-z]{2}(?:-[a-z]+)+-[0-9]+"
+    if not re.fullmatch(region_pattern, region):
         raise DDNSError("请输入 AWS Region，例如 ap-northeast-1。")
+    settings = {"aws": aws, "region": region, "profile": profile}
+    candidate = discover_lightsail(settings, config)
+    if candidate:
+        instance_name = candidate.get("name", "")
+        settings["instance_arn"] = candidate.get("arn")
+    else:
+        print("按现有 A 记录未能唯一定位 Lightsail 实例，请指定实例。", flush=True)
+        if region_detected:
+            region = input_with_default("Lightsail AWS Region", region)
+            if not re.fullmatch(region_pattern, region):
+                raise DDNSError("请输入 AWS Region，例如 ap-northeast-1。")
+            settings["region"] = region
+        instance_name = input_with_default("Lightsail 实例名称")
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*[A-Za-z0-9_]", instance_name):
         raise DDNSError("请输入 Lightsail 控制台中的实例名称。")
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", profile):
-        raise DDNSError("请输入有效的 AWS CLI profile 名称。")
-    if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
-        raise DDNSError("TCP 端口必须介于 1 和 65535。")
+    settings["instance_name"] = instance_name
+    return settings
 
-    settings = {
-        "aws": aws, "region": region, "instance_name": instance_name,
-        "profile": profile, "port": int(port),
-    }
+
+def prompt_lightsail(previous, config):
+    aws = shutil.which("aws")
+    if not aws:
+        raise DDNSError("请先在探测机安装 AWS CLI 并配置定时任务使用的 AWS 凭证。")
+
+    settings = {}
+    if previous:
+        target = f'{previous["region"]}/{previous["instance_name"]} TCP {previous["port"]}'
+        reuse = input(f"已配置 {target}，直接回车沿用，输入 r 重选：").strip().lower()
+        if reuse == "":
+            settings = {**previous, "aws": aws}
+        elif reuse != "r":
+            raise DDNSError("请回车沿用当前实例，或输入 r 重选。")
+    if not settings:
+        settings = choose_lightsail(config, aws)
     instance = lightsail_instance(settings)
     if instance.get("state", {}).get("name") != "running" or instance.get("isStaticIp") is not False:
         raise DDNSError("启用自动换址需要一台正在运行、使用动态公网 IPv4 的 Lightsail 实例。")
     address = lightsail_ipv4(instance)
     check_observer(address)
     settings["instance_arn"] = instance["arn"]
-    print(f"已找到 {instance_name}，当前公网 IPv4 为 {address}。", flush=True)
+    print(f'已找到 {settings["region"]}/{settings["instance_name"]}，公网 IPv4 为 {address}。', flush=True)
+    if "port" not in settings:
+        port = input("要探测的业务 TCP 端口 [443]：").strip()
+        if not port and not tcp_reachable(address, 443):
+            port = input("当前 443/TCP 未连通，请输入实际 TCP 端口：").strip()
+            if not port:
+                raise DDNSError("请填写 Lightsail 实际使用的 TCP 端口。")
+        port = port or "443"
+        if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+            raise DDNSError("TCP 端口必须介于 1 和 65535。")
+        settings["port"] = int(port)
     return settings, address
 
 
@@ -541,7 +627,7 @@ def install(enable_lightsail=False):
     config = {"token": token, "records": records}
     lightsail_address = None
     if enable_lightsail or previous.get("lightsail"):
-        config["lightsail"], lightsail_address = prompt_lightsail(previous.get("lightsail", {}))
+        config["lightsail"], lightsail_address = prompt_lightsail(previous.get("lightsail", {}), config)
 
     interpreter = sys.executable.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     service = f"""[Unit]
