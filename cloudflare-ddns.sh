@@ -181,15 +181,18 @@ def cloudflare_id(value):
     return value
 
 
-def find_zone(token, hostname, account_id=""):
+def list_zones(token, account_id=""):
     filters = {}
     if account_id:
         if not re.fullmatch(r"[0-9a-f]{32}", account_id, re.I):
             raise DDNSError("Cloudflare Account ID 应为 32 位十六进制字符。")
         filters["account.id"] = account_id
+    return list(list_entries(token, "/zones", filters))
 
+
+def find_zone(hostname, zones):
     matches = {}
-    for zone in list_entries(token, "/zones", filters):
+    for zone in zones:
         name = zone.get("name")
         if not isinstance(name, str):
             continue
@@ -216,20 +219,19 @@ def find_zone(token, hostname, account_id=""):
     return cloudflare_id(active[0].get("id")), zone_name
 
 
-def sync_record(config):
-    token, zone_id, name = config["token"], config["zone_id"], config["hostname"]
+def sync_record(token, target, ip, source):
+    zone_id, name = target["zone_id"], target["hostname"]
     endpoint = f"/zones/{cloudflare_id(zone_id)}/dns_records"
     entries = [
         record for record in list_entries(token, endpoint, {"name.exact": name})
         if record.get("name", "").lower() == name
     ]
     if any(record.get("type") in ("CNAME", "NS") for record in entries):
-        raise DDNSError(f"{name} 有同名 CNAME 或 NS 记录，请选择用于 DDNS 的 A 记录域名。")
+        raise DDNSError("有同名 CNAME 或 NS 记录，请选择用于 DDNS 的 A 记录域名。")
     records = [record for record in entries if record.get("type") == "A"]
     if len(records) > 1:
-        raise DDNSError(f"{name} 有多条同名 A 记录，请选择只有一条 A 记录的域名。")
+        raise DDNSError("有多条同名 A 记录，请选择只有一条 A 记录的域名。")
 
-    ip, source = current_ipv4()
     if records and records[0].get("content") == ip:
         print(f"{name} 已指向 {ip}（{source}）。", flush=True)
         return
@@ -248,9 +250,24 @@ def sync_record(config):
         print(f"已创建 {name} → {ip}（{source}）。", flush=True)
 
 
+def sync_records(config):
+    ip, source = current_ipv4()
+    errors = []
+    for target in config["records"]:
+        try:
+            sync_record(config["token"], target, ip, source)
+        except DDNSError as error:
+            errors.append(f'{target["hostname"]}：{error}')
+    if errors:
+        raise DDNSError("\n".join(errors))
+
+
 def read_config():
     with (STATE_DIR / "config.json").open(encoding="utf-8") as handle:
-        return json.load(handle)
+        config = json.load(handle)
+    if "records" not in config:
+        config["records"] = [{"hostname": config.pop("hostname"), "zone_id": config.pop("zone_id")}]
+    return config
 
 
 def write_file(path, content, mode):
@@ -277,29 +294,45 @@ def install():
         raise DDNSError("请在 FinalShell 或其他交互式 SSH 终端中运行。")
 
     previous = read_config() if (STATE_DIR / "config.json").is_file() else {}
-    old_name = previous.get("hostname", "")
-    name_prompt = f"完整域名 [{old_name}]：" if old_name else "完整域名（例如 node.example.com）："
-    hostname = hostname_from_input(input(name_prompt).strip() or old_name)
+    old_names = ", ".join(record["hostname"] for record in previous.get("records", []))
+    name_prompt = "完整域名（多个用逗号分隔）"
+    if old_names:
+        name_prompt += f" [{old_names}]"
+    value = input(name_prompt + "：").strip() or old_names
+    names = [hostname_from_input(name) for name in re.split(r"[,，\s]+", value) if name]
+    if not names:
+        raise DDNSError("请输入至少一个完整域名。")
+    hostnames = list(dict.fromkeys(names))
     old_token = previous.get("token", "")
     token_prompt = "Cloudflare API Token（回车沿用已有 Token）：" if old_token else "Cloudflare API Token："
     token = getpass.getpass(token_prompt).strip() or old_token
     if not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", token):
         raise DDNSError("请输入有效的 Cloudflare API Token。")
 
-    try:
-        zone_id, zone_name = find_zone(token, hostname)
-    except ZoneLookupError as error:
-        print(f"DDNS：{error}", file=sys.stderr, flush=True)
-        account_id = input("Cloudflare Account ID（可选，输入后重试，回车退出）：").strip()
-        if not account_id:
-            raise DDNSError("确认 Token 的 Zone 权限后可重新运行安装。") from None
-        zone_id, zone_name = find_zone(token, hostname, account_id)
-    config = {"hostname": hostname, "zone_id": zone_id, "token": token}
-    print(f"Cloudflare Zone：{zone_name}", flush=True)
+    zones = list_zones(token)
+    account_zones = None
+    records = []
+    for hostname in hostnames:
+        try:
+            zone_id, zone_name = find_zone(hostname, zones)
+        except ZoneLookupError as error:
+            if account_zones is None:
+                print(f"DDNS：{hostname}：{error}", file=sys.stderr, flush=True)
+                account_id = input("Cloudflare Account ID（可选，输入后重试，回车退出）：").strip()
+                if not account_id:
+                    raise DDNSError("确认 Token 的 Zone 权限后可重新运行安装。") from None
+                account_zones = list_zones(token, account_id)
+            try:
+                zone_id, zone_name = find_zone(hostname, account_zones)
+            except ZoneLookupError as error:
+                raise DDNSError(f"{hostname}：{error}") from None
+        records.append({"hostname": hostname, "zone_id": zone_id})
+        print(f"{hostname} 的 Cloudflare Zone：{zone_name}", flush=True)
+    config = {"token": token, "records": records}
 
     interpreter = sys.executable.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     service = f"""[Unit]
-Description=Update Cloudflare DDNS record
+Description=Update Cloudflare DDNS records
 Wants=network-online.target
 After=network-online.target
 
@@ -307,7 +340,7 @@ After=network-online.target
 Type=oneshot
 Environment=PYTHONIOENCODING=utf-8
 ExecStart="{interpreter}" {PROGRAM} update
-TimeoutStartSec=90
+TimeoutStartSec={max(90, 30 + 30 * len(records))}
 """
     timer = f"""[Unit]
 Description=Refresh Cloudflare DDNS every minute
@@ -322,7 +355,7 @@ Unit={SERVICE}
 WantedBy=timers.target
 """
     with config_lock():
-        sync_record(config)
+        sync_records(config)
         write_file(PROGRAM, Path(__file__).read_text(encoding="utf-8"), 0o755)
         write_file(UNIT_DIR / SERVICE, service, 0o644)
         write_file(UNIT_DIR / TIMER, timer, 0o644)
@@ -344,7 +377,7 @@ def main():
         install()
     elif sys.argv[1:] == ["update"]:
         with config_lock():
-            sync_record(read_config())
+            sync_records(read_config())
     else:
         raise DDNSError("请运行安装脚本，或执行 cloudflare-ddns update 手动同步。")
 
