@@ -61,6 +61,10 @@ class DDNSError(Exception):
     pass
 
 
+class ZoneLookupError(DDNSError):
+    pass
+
+
 def hostname_from_input(value):
     try:
         name = value.strip().encode("idna").decode("ascii").lower()
@@ -177,19 +181,39 @@ def cloudflare_id(value):
     return value
 
 
-def find_zone(token, hostname):
-    labels = hostname.split(".")
-    for start in range(len(labels) - 1):
-        candidate = ".".join(labels[start:])
-        zones = [
-            zone for zone in list_entries(token, "/zones", {"name": candidate, "status": "active"})
-            if zone.get("name", "").lower() == candidate
-        ]
-        if len(zones) > 1:
-            raise DDNSError("找到多个同名 Zone。请使用仅授权目标 Zone 的 API Token。")
-        if zones:
-            return cloudflare_id(zones[0].get("id")), candidate
-    raise DDNSError("找不到该域名所属的 Cloudflare Zone，请检查域名和 Zone Read 权限。")
+def find_zone(token, hostname, account_id=""):
+    filters = {}
+    if account_id:
+        if not re.fullmatch(r"[0-9a-f]{32}", account_id, re.I):
+            raise DDNSError("Cloudflare Account ID 应为 32 位十六进制字符。")
+        filters["account.id"] = account_id
+
+    matches = {}
+    for zone in list_entries(token, "/zones", filters):
+        name = zone.get("name")
+        if not isinstance(name, str):
+            continue
+        try:
+            zone_name = hostname_from_input(name)
+        except DDNSError:
+            continue
+        if hostname == zone_name or hostname.endswith("." + zone_name):
+            matches.setdefault(zone_name, []).append(zone)
+
+    if not matches:
+        raise ZoneLookupError(
+            "当前 Token 可见的 Zone 中找不到该域名。请确认 Token 的资源范围包含目标 Zone，"
+            "并授予 Zone Read 权限。"
+        )
+    zone_name = max(matches, key=len)
+    zones = matches[zone_name]
+    active = [zone for zone in zones if zone.get("status") == "active"]
+    if not active:
+        statuses = ", ".join(sorted({str(zone.get("status") or "unknown") for zone in zones}))
+        raise DDNSError(f"已找到 Zone {zone_name}，状态为 {statuses}。请在 Cloudflare 确认它已激活。")
+    if len(active) > 1:
+        raise ZoneLookupError("找到多个同名的 Active Zone。请按 Account ID 缩小查询范围。")
+    return cloudflare_id(active[0].get("id")), zone_name
 
 
 def sync_record(config):
@@ -262,7 +286,14 @@ def install():
     if not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", token):
         raise DDNSError("请输入有效的 Cloudflare API Token。")
 
-    zone_id, zone_name = find_zone(token, hostname)
+    try:
+        zone_id, zone_name = find_zone(token, hostname)
+    except ZoneLookupError as error:
+        print(f"DDNS：{error}", file=sys.stderr, flush=True)
+        account_id = input("Cloudflare Account ID（可选，输入后重试，回车退出）：").strip()
+        if not account_id:
+            raise DDNSError("确认 Token 的 Zone 权限后可重新运行安装。") from None
+        zone_id, zone_name = find_zone(token, hostname, account_id)
     config = {"hostname": hostname, "zone_id": zone_id, "token": token}
     print(f"Cloudflare Zone：{zone_name}", flush=True)
 

@@ -4,7 +4,7 @@
 
 ## 安装
 
-在 Cloudflare 的 API Token 页面创建一个用户 Token，把资源范围设为目标域名的 Zone，授予 **Zone → Zone → Read** 和 **Zone → DNS → Edit** 权限。安装时会根据完整域名查找 Zone，账号邮箱、Account ID 和 Zone ID 都可省略。
+在 Cloudflare 创建用户或账户级 API Token，把资源范围设为目标域名的 Zone，授予 **Zone → Zone → Read** 和 **Zone → DNS → Edit** 权限。安装时根据完整域名查找 Zone，支持中文域名和 Punycode。自动查找失败时，可以输入 Account ID 按账户重试。
 
 在新机器的 FinalShell 终端运行这一条命令。
 
